@@ -42,7 +42,7 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
 
     def __init__(self, output_dir: str = "output", backend: str = "pollinations",
                  force_lineart: bool = False, lineart_method: str = "enhanced",
-                 max_workers: int = 3):
+                 max_workers: int = 3, max_retries: int = 2):
         """Initialize parallel generator.
 
         Args:
@@ -52,9 +52,10 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
             lineart_method: Line art processing method
             max_workers: Maximum concurrent workers (default: 3)
                         Recommended: 2-4 to avoid rate limiting
+            max_retries: Extra attempts for a page that fails (default: 2)
 
         Raises:
-            ValueError: If max_workers is less than 1
+            ValueError: If max_workers is less than 1 or max_retries is negative
         """
         super().__init__(output_dir, backend, force_lineart, lineart_method)
 
@@ -65,7 +66,11 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
             logger.warning(f"max_workers={max_workers} is very high, may cause rate limiting")
             logger.warning("Recommended: 2-4 workers for most APIs")
 
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be >= 0, got {max_retries}")
+
         self.max_workers = max_workers
+        self.max_retries = max_retries
 
     def _generate_single_page(self, page_num: int, prompt: str,
                               images_dir: Path) -> Tuple[int, bool, dict]:
@@ -124,6 +129,18 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
             success = False
 
         return (page_num, success, page_data)
+
+    def _generate_page_with_retry(self, page_num: int, prompt: str,
+                                  images_dir: Path) -> Tuple[int, bool, dict]:
+        """Run _generate_single_page, retrying failures with backoff."""
+        for attempt in range(self.max_retries + 1):
+            result = self._generate_single_page(page_num, prompt, images_dir)
+            if result[1] or attempt == self.max_retries:
+                return result
+            delay = 2 ** (attempt + 1)
+            logger.warning(f"  [{page_num}] Retry {attempt + 1}/{self.max_retries} in {delay}s")
+            time.sleep(delay)
+        return result
 
     def generate_book_parallel(self, theme: str, num_pages: int = 30,
                               book_title: str = None,
@@ -189,7 +206,7 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all tasks
                 futures = {
-                    executor.submit(self._generate_single_page, page_num, prompt, images_dir): page_num
+                    executor.submit(self._generate_page_with_retry, page_num, prompt, images_dir): page_num
                     for page_num, prompt in batch_items
                 }
 
@@ -230,6 +247,8 @@ def main():
                        help='Number of pages to generate')
     parser.add_argument('--workers', type=int, default=3,
                        help='Number of parallel workers (2-4 recommended)')
+    parser.add_argument('--retries', type=int, default=2,
+                       help='Extra attempts per failed page')
     parser.add_argument('--title', help='Custom book title')
     parser.add_argument('--backend', default='pollinations',
                        choices=['pollinations', 'huggingface', 'replicate'],
@@ -244,7 +263,8 @@ def main():
         backend=args.backend,
         force_lineart=True,
         lineart_method=args.lineart_method,
-        max_workers=args.workers
+        max_workers=args.workers,
+        max_retries=args.retries
     )
 
     book_dir = gen.generate_book_parallel(
