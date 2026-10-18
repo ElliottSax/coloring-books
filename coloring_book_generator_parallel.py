@@ -21,7 +21,7 @@ Usage:
 """
 
 import concurrent.futures
-from typing import Tuple, Optional
+from typing import Callable, Tuple, Optional
 from pathlib import Path
 from datetime import datetime
 import time
@@ -42,7 +42,8 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
 
     def __init__(self, output_dir: str = "output", backend: str = "pollinations",
                  force_lineart: bool = False, lineart_method: str = "enhanced",
-                 max_workers: int = 3, max_retries: int = 2):
+                 max_workers: int = 3, max_retries: int = 2,
+                 progress_callback: Optional[Callable[[int, int, bool], None]] = None):
         """Initialize parallel generator.
 
         Args:
@@ -53,6 +54,8 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
             max_workers: Maximum concurrent workers (default: 3)
                         Recommended: 2-4 to avoid rate limiting
             max_retries: Extra attempts for a page that fails (default: 2)
+            progress_callback: Optional callable(completed, total, success) invoked
+                        from the main thread after each page finishes
 
         Raises:
             ValueError: If max_workers is less than 1 or max_retries is negative
@@ -71,6 +74,7 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
 
         self.max_workers = max_workers
         self.max_retries = max_retries
+        self.progress_callback = progress_callback
 
     def _generate_single_page(self, page_num: int, prompt: str,
                               images_dir: Path) -> Tuple[int, bool, dict]:
@@ -191,6 +195,7 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
         # Generate pages in parallel batches
         batch_size = batch_size or self.max_workers
         generated = []
+        completed = 0
         total_batches = (num_pages + batch_size - 1) // batch_size
 
         logger.info(f"Processing in {total_batches} batch(es) of {batch_size} pages")
@@ -214,6 +219,12 @@ class ParallelColoringBookGenerator(ColoringBookGenerator):
                 batch_results = []
                 for future in concurrent.futures.as_completed(futures):
                     page_num, success, page_data = future.result()
+                    completed += 1
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback(completed, num_pages, bool(success and page_data))
+                        except Exception as e:
+                            logger.warning(f"progress_callback raised: {e}")
                     if success and page_data:
                         batch_results.append(page_data)
 
