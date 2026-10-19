@@ -158,6 +158,38 @@ python3 -c "from coloring_book_generator import THEMES; print(f'{len(THEMES)} th
 - **v1.0**: Initial 7 themes (mandalas, animals, nature, geometric, fantasy, patterns, inspirational)
 - **v2.0**: Added 10 new themes (ocean, flowers, zen, christmas, halloween, celtic, japanese, space, food, architecture)
 
+## Validating themes
+
+Beyond the JSON one-liners in [Validation](#validation) above, `validate_themes.py`
+(repo root, standard library only) checks a themes file against what the generator
+actually reads (`name` and `prompts`) and prints a per-theme report:
+
+```bash
+python3 validate_themes.py                           # the bundled themes/themes.json
+python3 validate_themes.py themes/custom_themes.json
+python3 validate_themes.py --strict                  # warnings fail too
+```
+
+Exit status is `0` when clean, `1` on any error (or any warning with `--strict`) and
+`2` for a bad command line. Each finding ends with a check id such as `[duplicate-prompt]`.
+
+**Errors** (the generator would fail or silently misbehave): a missing or unreadable
+file, invalid UTF-8 or JSON (including a BOM), a top level that is not an object or has
+no themes, repeated keys (`json.load` silently keeps the last), theme keys that are not
+lowercase slugs, themes that are not objects, missing or wrongly typed `name`/`prompts`,
+a blank name or prompt, an empty `prompts` list, a `/` or `\` in `name` (it becomes the
+output directory name), a prompt over 1000 characters or a name over 100, and a prompt
+repeated within one theme.
+
+**Warnings** (quality heuristics): unknown fields, leading/trailing or repeated
+whitespace, fewer than 5 prompts, prompts under 40 or over 330 characters (shipped
+prompts are 81-165), names over 40 characters, a prompt ending in punctuation (the
+generator appends `, with ...` variations), a prompt or name shared between themes, and
+wording that fights black-and-white line art (color names, shading/gradient/gray,
+photo-realistic, black backgrounds). Negated phrases such as "no shading" are fine.
+
+Run the validator's own tests with `python3 test_validate_themes.py`.
+
 ---
 
 *For more information, see the main project README.md*
