@@ -828,6 +828,134 @@ class ColoringBookGenerator:
         metadata_file = book_dir / "metadata.json"
         metadata_file.write_text(json.dumps(metadata, indent=2))
 
+    def _create_book_dirs(self, title: str, timestamp: str) -> Tuple[Path, Path]:
+        """Create the directory tree for a new book.
+
+        Args:
+            title: Book title (spaces become "_" and ":" is dropped in the directory name)
+            timestamp: Generation timestamp, appended to the directory name
+
+        Returns:
+            Tuple of (book_dir, images_dir)
+        """
+        safe_title = title.replace(" ", "_").replace(":", "")
+        book_dir = self.output_dir / f"{safe_title}_{timestamp}"
+        book_dir.mkdir(parents=True, exist_ok=True)
+        images_dir = book_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        return book_dir, images_dir
+
+    def _build_page_prompt(self, prompts: List[str], index: int) -> str:
+        """Build the prompt for one page.
+
+        Cycles through the theme prompts and adds variety using the shared
+        variations. Draws from the global random state once per call, so call
+        it page by page, just before generating the page.
+
+        Args:
+            prompts: Theme prompts, used in rotation
+            index: Page index (0-indexed)
+
+        Returns:
+            Prompt with a randomly chosen variation appended
+        """
+        return prompts[index % len(prompts)] + random.choice(PROMPT_VARIATIONS)
+
+    def _validate_page_image(self, image_path: Path) -> Optional[Dict[str, Any]]:
+        """Run quality validation on a saved page image and log the outcome.
+
+        Args:
+            image_path: Path to the saved page image
+
+        Returns:
+            The validation result, or None if the image failed validation
+        """
+        validation = validate_image_quality(
+            image_path,
+            check_binary=self.force_lineart
+        )
+
+        if not validation['valid']:
+            logger.error(f"  ✗ Quality validation FAILED for {image_path.name}")
+            for issue in validation.get('issues', []):
+                logger.error(f"    - {issue}")
+            logger.error("  This is a CRITICAL error - image will not print correctly!")
+            return None
+
+        if validation.get('warnings'):
+            logger.warning(f"  ⚠ Quality warnings for {image_path.name}:")
+            for warning in validation['warnings']:
+                logger.warning(f"    - {warning}")
+
+        return validation
+
+    def _generate_and_validate_page(self, page_num: int, prompt: str,
+                                    images_dir: Path) -> Optional[Dict[str, Any]]:
+        """Generate, save and quality-check a single page.
+
+        Args:
+            page_num: Page number (1-indexed)
+            prompt: Image generation prompt
+            images_dir: Directory to save the page image in
+
+        Returns:
+            Page metadata dict if the page was generated and passed validation,
+            None otherwise
+        """
+        image_path = images_dir / f"page_{page_num:03d}.png"
+
+        # Generate image using centralized backend logic
+        image_bytes = self._generate_image_bytes(prompt, size=(1536, 1536))
+        if not image_bytes:
+            logger.warning(f"  ✗ Failed to generate page {page_num}")
+            return None
+
+        # Post-process (upscale and/or convert to line art)
+        image_path.write_bytes(self._post_process_image(image_bytes))
+
+        # QUALITY ASSURANCE: Validate the generated image
+        validation = self._validate_page_image(image_path)
+        if validation is None:
+            # Don't add to generated list if validation fails critically
+            return None
+
+        logger.info(f"  ✓ Saved and validated: {image_path.name}")
+        # Add metrics to metadata
+        return {
+            "page": page_num,
+            "prompt": prompt,
+            "file": str(image_path.name),
+            "quality_metrics": validation.get('metrics', {})
+        }
+
+    def _generate_all_pages(self, prompts: List[str], num_pages: int,
+                            images_dir: Path) -> List[Dict[str, Any]]:
+        """Generate every page of a book, one after another.
+
+        Args:
+            prompts: Theme prompts, used in rotation
+            num_pages: Number of pages to generate
+            images_dir: Directory to save the page images in
+
+        Returns:
+            Metadata dicts for the pages that were generated and passed validation
+        """
+        generated = []
+
+        for i in range(num_pages):
+            prompt = self._build_page_prompt(prompts, i)
+
+            logger.info(f"Generating page {i+1}/{num_pages}...")
+
+            page_data = self._generate_and_validate_page(i + 1, prompt, images_dir)
+            if page_data:
+                generated.append(page_data)
+
+            # Rate limiting
+            time.sleep(2)
+
+        return generated
+
     def generate_book(self, theme: str, num_pages: int = 30, book_title: str = None) -> Path:
         """Generate a complete coloring book."""
 
@@ -840,76 +968,17 @@ class ColoringBookGenerator:
 
         theme_data = THEMES[theme]
         title = book_title or theme_data["name"]
-        safe_title = title.replace(" ", "_").replace(":", "")
 
         # Create book directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        book_dir = self.output_dir / f"{safe_title}_{timestamp}"
-        book_dir.mkdir(parents=True, exist_ok=True)
-        images_dir = book_dir / "images"
-        images_dir.mkdir(exist_ok=True)
+        book_dir, images_dir = self._create_book_dirs(title, timestamp)
 
         logger.info(f"Generating coloring book: {title}")
         logger.info(f"Theme: {theme}, Pages: {num_pages}")
         logger.info(f"Output: {book_dir}")
 
         # Generate pages
-        prompts = theme_data["prompts"]
-        generated = []
-
-        for i in range(num_pages):
-            prompt = prompts[i % len(prompts)]
-
-            # Add variety using shared variations
-            prompt += random.choice(PROMPT_VARIATIONS)
-
-            logger.info(f"Generating page {i+1}/{num_pages}...")
-
-            image_path = images_dir / f"page_{i+1:03d}.png"
-            success = False
-
-            # Generate image using centralized backend logic
-            image_bytes = self._generate_image_bytes(prompt, size=(1536, 1536))
-            if image_bytes:
-                # Post-process (upscale and/or convert to line art)
-                image_bytes = self._post_process_image(image_bytes)
-                image_path.write_bytes(image_bytes)
-                success = True
-
-            if success:
-                # QUALITY ASSURANCE: Validate the generated image
-                validation = validate_image_quality(
-                    image_path,
-                    check_binary=self.force_lineart
-                )
-
-                if not validation['valid']:
-                    logger.error(f"  ✗ Quality validation FAILED for {image_path.name}")
-                    for issue in validation.get('issues', []):
-                        logger.error(f"    - {issue}")
-                    logger.error("  This is a CRITICAL error - image will not print correctly!")
-                    # Don't add to generated list if validation fails critically
-                    success = False
-                elif validation.get('warnings'):
-                    logger.warning(f"  ⚠ Quality warnings for {image_path.name}:")
-                    for warning in validation['warnings']:
-                        logger.warning(f"    - {warning}")
-
-                if success:
-                    # Add metrics to metadata
-                    page_data = {
-                        "page": i + 1,
-                        "prompt": prompt,
-                        "file": str(image_path.name),
-                        "quality_metrics": validation.get('metrics', {})
-                    }
-                    generated.append(page_data)
-                    logger.info(f"  ✓ Saved and validated: {image_path.name}")
-            else:
-                logger.warning(f"  ✗ Failed to generate page {i+1}")
-
-            # Rate limiting
-            time.sleep(2)
+        generated = self._generate_all_pages(theme_data["prompts"], num_pages, images_dir)
 
         # Save metadata using helper method
         self._save_book_metadata(book_dir, title, theme, num_pages, generated, timestamp)
