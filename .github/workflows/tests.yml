@@ -1,0 +1,144 @@
+# Runs the project's test scripts (plain Python scripts that exit non-zero on
+# failure, not pytest modules) on every push to main and on every pull request.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes a run that is still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Naming the shell explicitly makes steps run as `bash -eo pipefail`, so a
+    # failure anywhere in a pipeline fails the step.
+    shell: bash
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1" # keep script output in order with the runner's own log lines
+  PYTHONUTF8: "1" # the test scripts print emoji and box-drawing characters
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Quote the versions: YAML reads an unquoted 3.10 as the number 3.1.
+        # The code uses nothing newer than Python 3.6 syntax or stdlib (checked
+        # with vermin), so this is simply the range of interpreters worth covering.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          # requirements.txt names opencv-python, the desktop build of OpenCV. It
+          # links against libGL, which a headless runner may not provide, and then
+          # `import cv2` fails with "libGL.so.1: cannot open shared object file".
+          # Nothing in this project opens a window, so CI installs
+          # opencv-python-headless instead, with the same version specifier.
+          #
+          # requirements.txt stays as it is. Rather than installing it and then
+          # replacing the package (the two OpenCV wheels share one cv2/ directory,
+          # so uninstalling one damages the other, and the GUI wheel would be
+          # downloaded for nothing), install a CI-only copy with the package name
+          # swapped. That is a single pip run, so NumPy and OpenCV are resolved
+          # together, and the version bound still comes from requirements.txt.
+          sed -E 's/^opencv-python([^A-Za-z0-9._-]|$)/opencv-python-headless\1/' \
+            requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          grep -q '^opencv-python-headless' "$RUNNER_TEMP/requirements-ci.txt" \
+            || { echo "::error::no opencv-python line in requirements.txt to swap for the headless build"; exit 1; }
+          cat "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip freeze
+
+      - name: Check that the dependencies import
+        run: python -c "import cv2, numpy, PIL, reportlab, requests; print('opencv', cv2.__version__)"
+
+      - name: Byte-compile every tracked Python file
+        run: git ls-files -z '*.py' | xargs -0 python -m py_compile
+
+      - name: Validate themes
+        run: |
+          # Guarded so that branches without validate_themes.py still get a
+          # green run for everything else.
+          if [ -f validate_themes.py ]; then
+            python validate_themes.py --strict
+          else
+            echo "::notice::validate_themes.py not found, skipping theme validation"
+          fi
+
+      - name: Run test scripts
+        env:
+          # Scripts that cannot run in CI, separated by spaces:
+          #   test_improved_lineart.py - a manual demo rather than a test. It
+          #     generates real pages through the Pollinations.ai web API, so it
+          #     needs internet access, takes minutes and writes images to output/.
+          #     It also catches every exception and always exits 0, so it could
+          #     not fail the job even if it ran.
+          # Every other test_*.py in the repo root runs, including ones added
+          # later. test_quality_assurance.py offers an optional network-backed
+          # integration test through input(); stdin below is /dev/null, so it
+          # reaches EOF and skips that test, exactly as it does without --full.
+          SKIP_TESTS: test_improved_lineart.py
+        run: |
+          shopt -s nullglob
+          ran=0
+          failed=()
+          for script in test_*.py; do
+            case " $SKIP_TESTS " in
+              *" $script "*)
+                echo "::notice::skipping $script (listed in SKIP_TESTS)"
+                continue
+                ;;
+            esac
+            echo
+            echo "=============== $script ==============="
+            start=$SECONDS
+            # </dev/null: input() raises EOFError instead of waiting for a keyboard.
+            # timeout: a hung script fails by itself instead of using up the job.
+            if timeout --kill-after=10 600 python "$script" </dev/null; then
+              result="passed"
+            else
+              rc=$?
+              result="FAILED (exit code $rc)"
+              failed+=("$script")
+              echo "::error::$script failed with exit code $rc"
+            fi
+            echo "--- $script $result in $((SECONDS - start))s"
+            ran=$((ran + 1))
+          done
+
+          echo
+          echo "Ran $ran test script(s); ${#failed[@]} failed"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no test_*.py scripts found"
+            exit 1
+          fi
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '  FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
